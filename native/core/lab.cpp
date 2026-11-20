@@ -127,7 +127,35 @@ EchoAnalysis analyzeEcho(const EchoStim& s, const std::vector<float>& cap, int s
       hpk = std::fabs(p.h[k]);
       hk = int(k);
     }
+  // ---- capture health: things that make ANY canceller fail ----------------------------
+  const size_t D = size_t(p.delay + 32);
+  size_t clip = 0, zeroFrames = 0, run = 0, regionN = 0;
+  for (size_t i = D + size_t(sr / 2); i + size_t(sr / 2) < size_t(s.noiseLen) + D && i < cap.size() - size_t(s.noiseStart); i++) {
+    float v = mic[i];
+    regionN++;
+    if (std::fabs(v) >= 0.985f) clip++;
+    if (v == 0.f) run++;
+    else {
+      if (run >= 8) zeroFrames += run;
+      run = 0;
+    }
+  }
+  int jumps = 0, devMax = 0, blocks = 0;
+  {
+    const size_t blk = size_t(sr / 4);
+    for (size_t a = size_t(sr / 2); a + blk + size_t(sr) < size_t(s.noiseLen); a += blk) {
+      if (a + D + blk + 300 >= size_t(N)) break;
+      DelayResult d = findDelay(mic + a + D - 300, blk + 600, ref + a, blk, 600);
+      int dev = d.lag - 300;
+      blocks++;
+      if (std::abs(dev) > 2) jumps++;
+      devMax = std::max(devMax, std::abs(dev));
+    }
+  }
   r.ok = true;
+  j += ",\"clip_pct\":" + fmt("%.3f", 100.0 * double(clip) / double(std::max<size_t>(regionN, 1))) +
+       ",\"zero_frames\":" + std::to_string(zeroFrames) + ",\"lag_blocks\":" + std::to_string(blocks) +
+       ",\"lag_jumps\":" + std::to_string(jumps) + ",\"lag_dev_max\":" + std::to_string(devMax);
   j += ",\"ok\":true,\"delay_frames\":" + std::to_string(p.delay + 32) +
        ",\"delay_ms\":" + fmt("%.2f", 1000.0 * (p.delay + 32) / sr) +
        ",\"h_peak\":" + fmt("%.4f", hpk) + ",\"h_peak_tap\":" + std::to_string(hk) +

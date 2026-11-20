@@ -32,6 +32,7 @@ fun LabScreen(vm: StudioVM, onBack: () -> Unit) {
         BigButton("QUICK TEST (current settings, ~15 s)", C.green, idle) { vm.runLab("quick") }
         BigButton("FULL MATRIX (all mic modes, ~4 min)", C.blue, idle) { vm.runLab("matrix") }
         BigButton("RESTART JITTER (6 restarts, ~45 s)", C.amber, idle) { vm.runLab("jitter") }
+        BigButton("SHARE LAST TAKE (raw mic + playback, for tuning)", C.surface2.let { androidx.compose.ui.graphics.Color(0xFFB08CFF) }, vm.ui.state == 0 && vm.ui.busy == null) { vm.shareTakeDiagnostics() }
         if (lab.progress.isNotEmpty()) Text(lab.progress, color = C.text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
         lab.rows.forEach { r ->
             Card {

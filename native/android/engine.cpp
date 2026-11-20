@@ -42,7 +42,7 @@ bool Engine::init(const std::string& projectDir) {
   studio.setProjectDir(dir);
   studio.load();
   fz::EchoPath p;
-  if (fz::loadEchoPath(dir + "/echo.bin", p)) studio.setEchoPath(p);
+  if (fz::loadEchoPath(dir + "/echo2.bin", p)) studio.setEchoPath(p);
   return studio.echoPath().valid();
 }
 
@@ -111,21 +111,42 @@ std::string Engine::labEcho(int preset, int perf, const std::string& dumpDir, co
   }
   if (adopt && a.ok) {
     studio.setEchoPath(a.path);
-    fz::saveEchoPath(dir + "/echo.bin", a.path);
+    fz::saveEchoPath(dir + "/echo2.bin", a.path);
   }
   return wrap(c, tag, cap.streamJson, a.json);
 }
 
 std::string Engine::calibrate(const std::string& dumpDir) {
-  std::string lat = labLatency(cfg.inputPreset, cfg.perfMode, dumpDir, "calib");
-  // pull the median out of the json we just produced
+  // Try the chosen mic/latency mode first; some phones return silence in low-latency mode
+  // (seen on a Galaxy S23: mic dead in 3 of 5 modes). Fall back to modes that actually hear us.
+  struct Cand { int preset, perf; };
+  std::vector<Cand> cands = {{cfg.inputPreset, cfg.perfMode}, {cfg.inputPreset, 10}, {1, 10}, {5, 10}};
+  std::string lat;
   double med = -1;
-  size_t p = lat.find("\"median_frames\":");
-  if (p != std::string::npos) med = atof(lat.c_str() + p + 16);
-  std::string echo = labEcho(cfg.inputPreset, cfg.perfMode, dumpDir, "calib", true);
+  int usedPreset = cfg.inputPreset, usedPerf = cfg.perfMode;
+  std::vector<Cand> tried;
+  for (const Cand& c : cands) {
+    bool dup = false;
+    for (const Cand& t : tried) dup |= (t.preset == c.preset && t.perf == c.perf);
+    if (dup) continue;
+    tried.push_back(c);
+    lat = labLatency(c.preset, c.perf, dumpDir, "calib");
+    med = -1;
+    size_t p = lat.find("\"median_frames\":");
+    if (p != std::string::npos) med = atof(lat.c_str() + p + 16);
+    if (med > 0) {
+      usedPreset = c.preset;
+      usedPerf = c.perf;
+      break;
+    }
+  }
+  cfg.inputPreset = usedPreset;
+  cfg.perfMode = usedPerf;
+  std::string echo = med > 0 ? labEcho(usedPreset, usedPerf, dumpDir, "calib", true) : "{}";
   bool echoOk = echo.find("\"ok\":true") != std::string::npos;
-  char b[160];
-  snprintf(b, sizeof b, "{\"ok\":%s,\"rtl_frames\":%.0f,\"echo_ok\":%s,\"latency\":", med > 0 ? "true" : "false",
-           med, echoOk ? "true" : "false");
+  char b[220];
+  snprintf(b, sizeof b,
+           "{\"ok\":%s,\"rtl_frames\":%.0f,\"echo_ok\":%s,\"preset_used\":%d,\"perf_used\":%d,\"attempts\":%d,\"latency\":",
+           med > 0 ? "true" : "false", med, echoOk ? "true" : "false", usedPreset, usedPerf, int(tried.size()));
   return std::string(b) + lat + ",\"echo\":" + echo + "}";
 }

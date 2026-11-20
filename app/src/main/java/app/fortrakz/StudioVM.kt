@@ -34,7 +34,7 @@ data class TrackUi(
 data class UiState(
     val pos: Float = 0f,
     val len: Float = 0f,
-    val state: Int = 0,           // 0 stopped, 1 playing, 2 recording
+    val state: Int = 0,           // 0 stopped, 1 playing, 2 recording, 3 count-in
     val peaks: List<Float> = listOf(0f, 0f, 0f, 0f),
     val inPeak: Float = 0f,
     val takeSec: Float = 0f,
@@ -44,7 +44,14 @@ data class UiState(
     val message: String? = null,
     val calibrated: Boolean = false,
     val engineOk: Boolean = false,
-    val xruns: Int = 0,
+    val lateFrames: Int = 0,
+    val countBeat: Int = 0,
+    val countTotal: Int = 4,
+    val bpm: Int = 100,
+    val clickPlay: Boolean = false,
+    val startingRecord: Boolean = false,
+    val waveVer: Int = 0,
+    val liveN: Int = 0,
 )
 
 data class LabRow(val tag: String, val line1: String, val line2: String, val good: Boolean)
@@ -69,6 +76,12 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
         private set
     var lab by mutableStateOf(LabUi())
         private set
+    /** waveform envelope per track (max-abs per 50 ms) - read by the lanes */
+    @Volatile var waves: Array<FloatArray> = Array(4) { FloatArray(0) }
+        private set
+    /** live mic envelope of the track being recorded (one value per 50 ms poll) */
+    @Volatile var live = FloatArray(12100)
+        private set
     var settingsTick by mutableStateOf(0)  // bump to recompose settings after prefs change
         private set
 
@@ -91,8 +104,9 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
         NativeEngine.init(dir.absolutePath)
         val tracks = List(4) { TrackUi(prefs.gain(it), prefs.mute(it), prefs.solo(it), NativeEngine.hasTake(it)) }
         tracks.forEachIndexed { i, t -> NativeEngine.setTrack(i, t.gain, t.mute, t.solo) }
-        upd { it.copy(tracks = tracks, calibrated = NativeEngine.echoValid() && prefs.rtlFrames >= 0) }
+        upd { it.copy(tracks = tracks, calibrated = NativeEngine.echoValid() && prefs.rtlFrames >= 0, bpm = prefs.bpm, countTotal = prefs.countIn, clickPlay = prefs.clickPlay) }
         applyConfig()
+        refreshWaves()
         startEngine()
         viewModelScope.launch(Dispatchers.Default) { poll() }
     }
@@ -100,8 +114,16 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
     private fun applyConfig() {
         NativeEngine.setConfig(prefs.inputPreset, prefs.perfMode)
         NativeEngine.setCleanMode(prefs.cleanMode)
-        val rtl = prefs.rtlFrames
-        NativeEngine.setLatencyFrames(if (rtl >= 0) max(0, rtl + prefs.trimMs * 48) else 0)
+        NativeEngine.setLatencyFrames(max(0, prefs.rtlFrames))
+        NativeEngine.setTrimFrames(prefs.trimMs * 48)
+        NativeEngine.setClick(prefs.bpm, prefs.countIn, prefs.clickPlay, prefs.countOnPlay)
+    }
+
+    private fun refreshWaves() {
+        val buf = FloatArray(12100)
+        val w = Array(4) { t -> val n = NativeEngine.peaks(t, 2400, buf); buf.copyOf(n) }
+        waves = w
+        upd { it.copy(waveVer = it.waveVer + 1) }
     }
 
     private fun startEngine() {
@@ -126,8 +148,9 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun poll() {
-        val b = FloatArray(12)
+        val b = FloatArray(14)
         var prev = 0
+        var liveCount = 0
         while (viewModelScope.isActive) {
             NativeEngine.status(b)
             val st = b[2].toInt()
@@ -135,9 +158,16 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
             upd { it.copy(
                 pos = b[0], len = b[1], state = st,
                 peaks = listOf(b[3], b[4], b[5], b[6]), inPeak = b[7], takeSec = b[8],
-                xruns = b[10].toInt(),
+                lateFrames = b[11].toInt(), countBeat = b[10].toInt(),
                 tracks = it.tracks.mapIndexed { i, tr -> tr.copy(hasTake = takes[i]) },
             ) }
+            if (st == 2) {
+                if (prev != 2) liveCount = 0
+                if (liveCount < live.size) live[liveCount++] = b[7]
+                upd { it.copy(liveN = liveCount) }
+            } else if (prev == 2) upd { it.copy(liveN = 0) }
+            if (st == 0 && prev == 3) upd { it.copy(startingRecord = false) }
+            if (st == 2 && prev == 3) upd { it.copy(startingRecord = false) }
             if (prev == 2 && st == 0 && !finishing) finishTake()  // hit the 10 minute cap
             prev = st
             delay(50)
@@ -159,20 +189,23 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
         upd { it.copy(armed = if (it.armed == t) -1 else t) }
     }
 
-    fun rewind() { if (ui.state != 2 && ui.busy == null) NativeEngine.seek(0f) }
+    fun rewind() { if (ui.state < 2 && ui.busy == null) NativeEngine.seek(0f) }
 
     fun play() {
         if (ui.busy != null || !ui.engineOk) return
-        if (ui.state == 2) return
+        if (ui.state == 2 || ui.state == 3) return
         NativeEngine.play()
     }
 
     fun record() {
-        if (ui.busy != null || !ui.engineOk || ui.state == 2) return
+        if (ui.busy != null || !ui.engineOk || ui.state == 2 || ui.state == 3) return
         if (ui.armed < 0) { say("Tap the red circle on a track first, then press record."); return }
         if (!ui.calibrated) say("Not calibrated yet: the new track will land a little late. Calibrate in settings.")
+        upd { it.copy(startingRecord = true) }
         NativeEngine.record(ui.armed)
     }
+
+    fun seek(sec: Float) { if (ui.state == 0 || ui.state == 1) NativeEngine.seek(max(0f, sec)) }
 
     fun stop() {
         if (ui.busy != null) return
@@ -187,14 +220,23 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
     private fun finishTake() {
         finishing = true
         upd { it.copy(busy = "Cleaning up your take…") }
-        val r = JSONObject(NativeEngine.finalizeTake())
+        val raw = NativeEngine.finalizeTake()
+        val r = JSONObject(raw)
         finishing = false
         upd { it.copy(busy = null) }
+        refreshWaves()
         if (r.optBoolean("ok")) {
+            prefs.lastTakeTrack = r.optInt("track", -1)
+            runCatching { File(File(getApplication<Application>().filesDir, "project"), "lastTake.json").writeText(raw) }
             val red = r.optDouble("reduction_db", 0.0)
+            val learned = r.optBoolean("fit_used")
             say(
-                if (r.optBoolean("cleaned")) "Take saved. Speaker bleed reduced (${"%.1f".format(Locale.US, red)} dB overall)."
-                else "Take saved (bleed cancellation off)."
+                when {
+                    !r.optBoolean("cleaned") -> "Take saved (bleed cancellation off)."
+                    learned -> "Take saved. Learned this take's speaker path: ${"%.0f".format(Locale.US, r.optInt("fit_delay") / 48.0)} ms delay, bleed -${"%.1f".format(Locale.US, red)} dB."
+                    r.optBoolean("fit_tried") -> "Take saved. Couldn't learn the path from this take (too quiet backing?), used the calibration."
+                    else -> "Take saved. Bleed -${"%.1f".format(Locale.US, red)} dB."
+                }
             )
         } else say("Take failed: ${r.optString("error")}")
     }
@@ -213,7 +255,7 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
 
     fun clear(t: Int) {
         if (ui.state != 0) return
-        viewModelScope.launch(Dispatchers.Default) { NativeEngine.clearTrack(t); say("Track ${t + 1} cleared.") }
+        viewModelScope.launch(Dispatchers.Default) { NativeEngine.clearTrack(t); refreshWaves(); say("Track ${t + 1} cleared.") }
     }
 
     fun reclean(t: Int) {
@@ -222,13 +264,14 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
             upd { it.copy(busy = "Re-processing track ${t + 1}…") }
             val r = JSONObject(NativeEngine.reclean(t))
             upd { it.copy(busy = null) }
+            refreshWaves()
             say(if (r.optBoolean("ok")) "Track ${t + 1} re-processed with current settings." else "Can't re-process: ${r.optString("error")}")
         }
     }
 
     fun clearAll() {
         if (ui.state != 0) return
-        viewModelScope.launch(Dispatchers.Default) { NativeEngine.clearAll(); say("All tracks cleared.") }
+        viewModelScope.launch(Dispatchers.Default) { NativeEngine.clearAll(); refreshWaves(); say("All tracks cleared.") }
     }
 
     fun exportMix() {
@@ -257,9 +300,18 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
     fun setClean(m: Int) { prefs.cleanMode = m; settingsTick++; NativeEngine.setCleanMode(m) }
     fun setTrim(ms: Int) {
         prefs.trimMs = ms.coerceIn(-150, 150); settingsTick++
-        val rtl = prefs.rtlFrames
-        NativeEngine.setLatencyFrames(if (rtl >= 0) max(0, rtl + prefs.trimMs * 48) else 0)
+        NativeEngine.setTrimFrames(prefs.trimMs * 48)
     }
+
+    private fun pushClick() {
+        NativeEngine.setClick(prefs.bpm, prefs.countIn, prefs.clickPlay, prefs.countOnPlay)
+        upd { it.copy(bpm = prefs.bpm, countTotal = prefs.countIn, clickPlay = prefs.clickPlay) }
+        settingsTick++
+    }
+    fun setBpm(v: Int) { prefs.bpm = v; pushClick() }
+    fun setCountIn(v: Int) { prefs.countIn = v; pushClick() }
+    fun toggleClickPlay() { prefs.clickPlay = !prefs.clickPlay; pushClick() }
+    fun toggleCountOnPlay() { prefs.countOnPlay = !prefs.countOnPlay; pushClick() }
 
     private fun markUncalibrated() {
         upd { it.copy(calibrated = false) }
@@ -274,14 +326,18 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
             val j = runCatching { JSONObject(NativeEngine.calibrate(dir.absolutePath)) }.getOrNull()
             applyConfig()
             if (j != null && j.optBoolean("ok")) {
+                val fb = j.optInt("perf_used", prefs.perfMode) != prefs.perfMode || j.optInt("preset_used", prefs.inputPreset) != prefs.inputPreset
+                prefs.perfMode = j.optInt("perf_used", prefs.perfMode)
+                prefs.inputPreset = j.optInt("preset_used", prefs.inputPreset)
                 prefs.rtlFrames = j.getDouble("rtl_frames").roundToInt()
                 val ms = prefs.rtlFrames / 48.0
                 val echoRes = j.optJSONObject("echo")?.optJSONObject("result")
                 val erle = echoRes?.optDouble("erle_test_db", Double.NaN) ?: Double.NaN
                 prefs.calibNote =
                     "Round trip ${"%.1f".format(Locale.US, ms)} ms" +
-                        if (j.optBoolean("echo_ok") && !erle.isNaN()) " · bleed cancel ${"%.0f".format(Locale.US, erle)} dB" else " · echo path failed (turn volume up)"
-                NativeEngine.setLatencyFrames(max(0, prefs.rtlFrames + prefs.trimMs * 48))
+                        if (j.optBoolean("echo_ok") && !erle.isNaN()) " · quick bleed test ${"%.0f".format(Locale.US, erle)} dB" else " · echo path failed (turn volume up)"
+                NativeEngine.setLatencyFrames(max(0, prefs.rtlFrames))
+                if (fb) prefs.calibNote += " · switched mic/latency mode automatically (the chosen one heard nothing)"
             } else {
                 prefs.calibNote = "Calibration failed: the mic didn't hear the chirps. Raise volume / check mic."
             }
@@ -311,7 +367,7 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
             put("music_volume", am.getStreamVolume(AudioManager.STREAM_MUSIC))
             put("music_volume_max", am.getStreamMaxVolume(AudioManager.STREAM_MUSIC))
             put("audio_devices", routes)
-            put("app_version", "0.1.0")
+            put("app_version", "0.2.0")
         }
     }
 
@@ -323,7 +379,7 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
         else "latency: not heard (${lat?.optInt("valid", 0) ?: 0}/${lat?.optInt("sent", 0) ?: 0})"
         val l2 = when {
             echo == null -> ""
-            echo.optBoolean("ok") -> "bleed cancel ${"%.0f".format(Locale.US, echo.getDouble("erle_test_db"))} dB  (adaptive ${"%.0f".format(Locale.US, echo.getDouble("erle_test_adaptive_db"))} dB)"
+            echo.optBoolean("ok") -> "bleed cancel ${"%.0f".format(Locale.US, echo.getDouble("erle_test_db"))} dB · health: clip ${"%.1f".format(Locale.US, echo.optDouble("clip_pct"))}%, zeros ${echo.optInt("zero_frames")}, jumps ${echo.optInt("lag_jumps")}/${echo.optInt("lag_blocks")}"
             else -> "echo: ${echo.optString("error", "failed")}"
         }
         return LabRow(tag, l1, l2, lat?.has("median_ms") == true && (echo == null || echo.optBoolean("ok")))
@@ -361,6 +417,29 @@ class StudioVM(app: Application) : AndroidViewModel(app) {
             applyConfig()
             startEngine()
             lab = lab.copy(running = false, progress = "Done. ${rows.size} run(s) saved. Tap Share to send me the zip.")
+        }
+    }
+
+    /** Zip the last recorded take (raw mic + what was playing) with the reports, for offline analysis. */
+    fun shareTakeDiagnostics() {
+        viewModelScope.launch(Dispatchers.Default) {
+            val ctx = getApplication<Application>()
+            val proj = File(ctx.filesDir, "project")
+            val t = prefs.lastTakeTrack
+            if (t < 0 || !File(proj, "take${t}_raw.pcm").exists()) { say("Record a take first."); return@launch }
+            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+            val dir = File(ctx.cacheDir, "share/take-diag-$stamp").apply { deleteRecursively(); mkdirs() }
+            listOf("take${t}_raw.pcm", "take${t}_ref.pcm", "project.txt", "echo2.bin", "lastTake.json").forEach { n ->
+                File(proj, n).takeIf { it.exists() }?.copyTo(File(dir, n), overwrite = true)
+            }
+            File(dir, "device.json").writeText(deviceJson().put("prefs", JSONObject().apply {
+                put("preset", prefs.inputPreset); put("perf", prefs.perfMode); put("clean", prefs.cleanMode)
+                put("rtl_frames", prefs.rtlFrames); put("trim_ms", prefs.trimMs); put("bpm", prefs.bpm)
+            }).toString())
+            File(dir, "FORMAT.txt").writeText("take*_raw.pcm = mic, take*_ref.pcm = what was played, both int16 mono 48000 Hz, aligned at index 0 (the mic lags by the echo delay in lastTake.json).")
+            val z = File(ctx.cacheDir, "share/fortrakz-take-diag-$stamp.zip")
+            Share.zipDir(dir, z)
+            Share.shareFile(ctx, z, "application/zip", "Share take diagnostics")
         }
     }
 

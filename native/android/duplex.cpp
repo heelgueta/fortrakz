@@ -27,12 +27,12 @@ bool Duplex::open(const Config& cfg, Processor* proc) {
         ->setChannelCount(1)
         ->setChannelConversionAllowed(true)
         ->setSampleRate(cfg.sampleRate)
-        ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium);
+        ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
+        ->setErrorCallback(this);
     if (dir == oboe::Direction::Input) {
-      b.setInputPreset(static_cast<oboe::InputPreset>(preset));
+      b.setInputPreset(static_cast<oboe::InputPreset>(preset))->setDataCallback(&inCb_);
     } else {
-      b.setUsage(oboe::Usage::Media)->setContentType(oboe::ContentType::Music);
-      b.setDataCallback(this)->setErrorCallback(this);
+      b.setUsage(oboe::Usage::Media)->setContentType(oboe::ContentType::Music)->setDataCallback(this);
     }
     std::shared_ptr<oboe::AudioStream> s;
     oboe::Result r = b.openStream(s);
@@ -48,23 +48,22 @@ bool Duplex::open(const Config& cfg, Processor* proc) {
   if (!in_) return false;
   out_ = build(oboe::Direction::Output, 0);
   if (!out_) {
+    in_->close();
     in_.reset();
     return false;
   }
   out_->setBufferSizeInFrames(out_->getFramesPerBurst() * 2);
-  cushion_ = std::max<int32_t>(in_->getFramesPerBurst(), out_->getFramesPerBurst());
+  cushion_ = int64_t(in_->getFramesPerBurst()) + out_->getFramesPerBurst();
   return true;
 }
 
 bool Duplex::start() {
   if (!in_ || !out_) return false;
-  xruns_ = 0;
-  callbacks_ = 0;
+  aligner_.reset();
   if (in_->requestStart() != oboe::Result::OK) return false;
-  // let the input fill a few bursts so the first output callback has data
-  for (int i = 0; i < 120; i++) {
-    int64_t have = in_->getFramesWritten() - in_->getFramesRead();
-    if (have >= 3 * int64_t(in_->getFramesPerBurst())) break;
+  // let the input deliver a few bursts so the first output callback anchors on real data
+  for (int i = 0; i < 160; i++) {
+    if (aligner_.written() >= 3 * int64_t(in_->getFramesPerBurst())) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   running_ = true;
@@ -93,26 +92,11 @@ void Duplex::close() {
 
 oboe::DataCallbackResult Duplex::onAudioReady(oboe::AudioStream*, void* data, int32_t n) {
   float* out = static_cast<float*>(data);
-  if (!running_.load() || n > kMaxBlock || !in_) {
+  if (!running_.load() || n > kMaxBlock) {
     std::fill(out, out + n, 0.f);
     return oboe::DataCallbackResult::Continue;
   }
-  const int cb = callbacks_.fetch_add(1);
-  // drop input backlog beyond (one block + cushion) so alignment stays constant
-  int64_t backlog = in_->getFramesWritten() - in_->getFramesRead();
-  int64_t excess = backlog - (n + cushion_);
-  while (excess > 0) {
-    int32_t c = int32_t(std::min<int64_t>(excess, kMaxBlock));
-    auto r = in_->read(inBuf_.data(), c, 0);
-    if (!r || r.value() <= 0) break;
-    excess -= r.value();
-  }
-  auto r = in_->read(inBuf_.data(), n, 0);
-  int32_t got = r ? r.value() : 0;
-  if (got < n) {
-    std::fill(inBuf_.begin() + got, inBuf_.begin() + n, 0.f);
-    if (cb > 8) xruns_++;
-  }
+  aligner_.read(inBuf_.data(), n, cushion_);
   proc_->process(inBuf_.data(), out, n);
   return oboe::DataCallbackResult::Continue;
 }
@@ -130,22 +114,24 @@ void Duplex::onErrorAfterClose(oboe::AudioStream*, oboe::Result r) {
 }
 
 std::string Duplex::infoJson() const {
-  char b[900];
+  char b[1000];
   if (!in_ || !out_) return "{}";
   double lat = -1;
   if (auto l = out_->calculateLatencyMillis()) lat = l.value();
   auto xr = out_->getXRunCount();
   snprintf(b, sizeof b,
-           "{\"api\":\"%s\",\"sample_rate\":%d,\"in_sample_rate\":%d,\"in_preset_req\":%d,"
+           "{\"engine\":\"ring-aligned\",\"api\":\"%s\",\"sample_rate\":%d,\"in_sample_rate\":%d,\"in_preset_req\":%d,"
            "\"in_preset_actual\":%d,\"in_fallback\":%s,\"perf_req\":%d,\"in_perf\":%d,\"out_perf\":%d,"
            "\"in_sharing\":%d,\"out_sharing\":%d,\"in_burst\":%d,\"out_burst\":%d,\"out_buffer\":%d,"
            "\"out_capacity\":%d,\"in_capacity\":%d,\"in_device\":%d,\"out_device\":%d,"
-           "\"reported_out_latency_ms\":%.2f,\"xruns\":%d,\"callback_xruns\":%d}",
+           "\"reported_out_latency_ms\":%.2f,\"xruns\":%d,\"late_frames\":%lld,\"resyncs\":%d,"
+           "\"input_offset\":%lld}",
            oboe::convertToText(out_->getAudioApi()), out_->getSampleRate(), in_->getSampleRate(),
            cfg_.inputPreset, int(in_->getInputPreset()), inputFellBack_ ? "true" : "false", cfg_.perfMode,
            int(in_->getPerformanceMode()), int(out_->getPerformanceMode()), int(in_->getSharingMode()),
            int(out_->getSharingMode()), in_->getFramesPerBurst(), out_->getFramesPerBurst(),
            out_->getBufferSizeInFrames(), out_->getBufferCapacityInFrames(), in_->getBufferCapacityInFrames(),
-           in_->getDeviceId(), out_->getDeviceId(), lat, xr ? xr.value() : -1, xruns_.load());
+           in_->getDeviceId(), out_->getDeviceId(), lat, xr ? xr.value() : -1,
+           (long long)aligner_.lateFrames(), aligner_.resyncs(), (long long)aligner_.offset());
   return b;
 }

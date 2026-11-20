@@ -89,14 +89,29 @@ fun SettingsScreen(vm: StudioVM, onBack: () -> Unit) {
 
         Card {
             Text("Bleed cancellation", color = C.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Text(
+                "Learning from the take uses the music that was actually playing while you recorded, at its real volume, so it doesn't depend on the calibration sound.",
+                color = C.dim, fontSize = 13.sp,
+            )
             Spacer(Modifier.height(6.dp))
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Choice("Learn from each take (recommended)", p.cleanMode == 3) { vm.setClean(3) }
+                Choice("Learn + re-learn every 15 s (long takes)", p.cleanMode == 4) { vm.setClean(4) }
+                Choice("Calibrated filter only", p.cleanMode == 1) { vm.setClean(1) }
                 Choice("Off (raw mic)", p.cleanMode == 0) { vm.setClean(0) }
-                Choice("Subtract speaker (calibrated)", p.cleanMode == 1) { vm.setClean(1) }
-                Choice("Subtract + track changes (slower)", p.cleanMode == 2) { vm.setClean(2) }
             }
             Spacer(Modifier.height(4.dp))
             Text("Applies to new takes. Use the refresh icon on a track to re-process it.", color = C.dim, fontSize = 13.sp)
+        }
+
+        Card {
+            Text("Click track", color = C.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Text("BPM and count-in are on the main screen. Count-in always plays before recording.", color = C.dim, fontSize = 13.sp)
+            Spacer(Modifier.height(6.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Choice("Also count in before plain playback", p.countOnPlay) { vm.toggleCountOnPlay() }
+                Choice("Keep clicking while playing / recording", p.clickPlay) { vm.toggleClickPlay() }
+            }
         }
 
         Card {

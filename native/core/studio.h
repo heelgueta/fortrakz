@@ -17,8 +17,9 @@ class Studio {
   static constexpr int kTracks = 4;
   static constexpr int kSr = 48000;
   static constexpr int64_t kCap = int64_t(600) * kSr;  // 10 min per track
-  enum State { kStopped = 0, kPlaying = 1, kRecording = 2 };
-  enum CleanMode { kCleanOff = 0, kCleanFixed = 1, kCleanAdaptive = 2 };
+  enum State { kStopped = 0, kPlaying = 1, kRecording = 2, kCountIn = 3 };
+  // 0 off | 1 calibrated filter | 2 calibrated + adaptive | 3 learn from the take | 4 learn + adaptive
+  enum CleanMode { kCleanOff = 0, kCleanFixed = 1, kCleanAdaptive = 2, kCleanLearn = 3, kCleanLearnAdaptive = 4 };
 
   Studio();
   ~Studio();
@@ -38,8 +39,12 @@ class Studio {
   int64_t position() const { return pos_.load(); }
 
   void setTrack(int t, float gain, bool mute, bool solo);
-  void setLatencyFrames(int f) { latency_ = f; }
+  void setLatencyFrames(int f) { latency_ = f; }  // calibrated round trip
+  void setTrimFrames(int f) { trim_ = f; }        // user fine-tune, added to every placement
   int latencyFrames() const { return latency_; }
+  // metronome: bpm 30..300, count-in beats 0..8 (before play/record from stop),
+  // clickPlay = keep clicking during playback/recording; countOnPlay = also count in before plain playback
+  void setClick(int bpm, int countIn, bool clickPlay, bool countOnPlay);
   void setCleanMode(int m) { cleanMode_ = m; }
   void setEchoPath(const EchoPath& p) { echo_ = p; }
   const EchoPath& echoPath() const { return echo_; }
@@ -52,6 +57,8 @@ class Studio {
   void clearAll();
   int64_t trackLength(int t) const { return len_[t].load(); }
   bool hasTake(int t) const { return take_[t].has; }
+  // max-abs per `bucket` frames, scaled 0..1. Returns bucket count written.
+  int peaks(int t, int bucket, float* out, int cap) const;
 
   void setProjectDir(const std::string& dir) { dir_ = dir; }
   bool save();
@@ -59,7 +66,7 @@ class Studio {
   bool exportMix(const std::string& wavPath);
 
   // out: [0]=pos s [1]=len s [2]=state [3..6]=track peaks [7]=input peak
-  //      [8]=take seconds so far [9]=armed track
+  //      [8]=take seconds so far [9]=armed track [10]=count-in beat (1..N, 0 none)
   void status(float* out, int cap) const;
 
  private:
@@ -68,6 +75,9 @@ class Studio {
     int64_t start = 0, n = 0, lat = 0, pStart = 0, pEnd = 0;
   };
   float mixAt(int64_t q, int skipTrack, bool anySolo) const;
+  void processMusic(const float* in, float* out, int n, int st);
+  float clickAt(double offsetFrames, bool accent) const;
+  double beatFrames() const { return double(kSr) * 60.0 / double(bpm_.load()); }
   std::string place(int t, const int16_t* raw, const int16_t* ref, int64_t n, int64_t start,
                     int64_t lat, bool wipePrevious);
   int64_t maxLen() const;
@@ -92,6 +102,11 @@ class Studio {
 
   Take take_[kTracks];
   int latency_ = 0;
+  int trim_ = 0;
+  std::atomic<int> bpm_{100}, countIn_{0}, countBeat_{0};
+  std::atomic<bool> clickPlay_{false}, countOnPlay_{false};
+  std::atomic<int> pending_{kPlaying};
+  int64_t cn_ = 0;
   int cleanMode_ = kCleanFixed;
   EchoPath echo_;
   std::string dir_;

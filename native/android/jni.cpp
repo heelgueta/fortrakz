@@ -1,6 +1,7 @@
 #include <jni.h>
 
 #include <string>
+#include <vector>
 
 #include "engine.h"
 
@@ -17,6 +18,12 @@ static jstring jstr(JNIEnv* env, const std::string& s) { return env->NewStringUT
 #define FN(ret, name) extern "C" JNIEXPORT ret JNICALL Java_app_fortrakz_NativeEngine_##name
 
 FN(jboolean, init)(JNIEnv* env, jobject, jstring dir) { return g.init(str(env, dir)); }
+FN(jintArray, getConfig)(JNIEnv* env, jobject) {
+  jint v[2] = {g.cfg.inputPreset, g.cfg.perfMode};
+  jintArray a = env->NewIntArray(2);
+  env->SetIntArrayRegion(a, 0, 2, v);
+  return a;
+}
 FN(void, setConfig)(JNIEnv*, jobject, jint preset, jint perf) {
   g.cfg.inputPreset = preset;
   g.cfg.perfMode = perf;
@@ -32,6 +39,17 @@ FN(void, setTrack)(JNIEnv*, jobject, jint t, jfloat gain, jboolean mute, jboolea
   g.studio.setTrack(t, gain, mute, solo);
 }
 FN(void, setLatencyFrames)(JNIEnv*, jobject, jint f) { g.studio.setLatencyFrames(f); }
+FN(void, setTrimFrames)(JNIEnv*, jobject, jint f) { g.studio.setTrimFrames(f); }
+FN(void, setClick)(JNIEnv*, jobject, jint bpm, jint countIn, jboolean clickPlay, jboolean countOnPlay) {
+  g.studio.setClick(bpm, countIn, clickPlay, countOnPlay);
+}
+FN(jint, peaks)(JNIEnv* env, jobject, jint t, jint bucket, jfloatArray out) {
+  jsize cap = env->GetArrayLength(out);
+  std::vector<float> tmp(static_cast<size_t>(cap), 0.f);
+  int n = g.studio.peaks(t, bucket, tmp.data(), int(cap));
+  env->SetFloatArrayRegion(out, 0, n, tmp.data());
+  return n;
+}
 FN(void, setCleanMode)(JNIEnv*, jobject, jint m) { g.studio.setCleanMode(m); }
 FN(jstring, finalizeTake)(JNIEnv* env, jobject) { return jstr(env, g.studio.finalizeTake()); }
 FN(jstring, reclean)(JNIEnv* env, jobject, jint t) { return jstr(env, g.studio.reclean(t)); }
@@ -42,11 +60,11 @@ FN(jboolean, echoValid)(JNIEnv*, jobject) { return g.echoValid(); }
 FN(jboolean, saveProject)(JNIEnv*, jobject) { return g.studio.save(); }
 FN(jboolean, exportMix)(JNIEnv* env, jobject, jstring path) { return g.studio.exportMix(str(env, path)); }
 FN(void, status)(JNIEnv* env, jobject, jfloatArray arr) {
-  float v[12] = {0};
-  g.studio.status(v, 10);
-  v[10] = float(g.duplex.xruns());
-  v[11] = g.duplex.isOpen() ? 1.f : 0.f;
-  env->SetFloatArrayRegion(arr, 0, 12, v);
+  float v[14] = {0};
+  g.studio.status(v, 11);
+  v[11] = float(g.duplex.lateFrames());
+  v[12] = g.duplex.isOpen() ? 1.f : 0.f;
+  env->SetFloatArrayRegion(arr, 0, 14, v);
 }
 FN(jstring, calibrate)(JNIEnv* env, jobject, jstring dump) { return jstr(env, g.calibrate(str(env, dump))); }
 FN(jstring, labLatency)(JNIEnv* env, jobject, jint preset, jint perf, jstring dump, jstring tag) {

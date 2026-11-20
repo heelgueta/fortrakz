@@ -45,12 +45,57 @@ int64_t Studio::maxLen() const {
 
 // ---- audio thread ----------------------------------------------------------------
 
+float Studio::clickAt(double off, bool accent) const {
+  const double dur = 0.04 * kSr;
+  if (off < 0 || off >= dur) return 0.f;
+  const double t = off / kSr;
+  const double f = accent ? 1600.0 : 1100.0;
+  return float(0.7 * std::exp(-t * 110.0) * std::sin(2.0 * M_PI * f * t));
+}
+
+void Studio::setClick(int bpm, int countIn, bool clickPlay, bool countOnPlay) {
+  bpm_.store(std::max(30, std::min(300, bpm)));
+  countIn_.store(std::max(0, std::min(8, countIn)));
+  clickPlay_.store(clickPlay);
+  countOnPlay_.store(countOnPlay);
+}
+
 void Studio::process(const float* in, float* out, int n) {
   float ip = 0.f;
   for (int i = 0; i < n; i++) ip = std::max(ip, std::fabs(in[i]));
   inPeak_.store(std::max(ip, inPeak_.load() * 0.92f));
 
-  const int st = state_.load(std::memory_order_acquire);
+  int st = state_.load(std::memory_order_acquire);
+  if (st == kCountIn) {
+    const double beat = beatFrames();
+    const int64_t total = int64_t(std::llround(beat * countIn_.load()));
+    const int64_t m = std::min<int64_t>(n, std::max<int64_t>(0, total - cn_));
+    for (int64_t i = 0; i < m; i++) {
+      const double f = double(cn_ + i);
+      const double bi = std::floor(f / beat);
+      out[i] = clickAt(f - bi * beat, bi < 0.5);
+    }
+    cn_ += m;
+    countBeat_.store(int(std::min<double>(countIn_.load(), std::floor(double(cn_) / beat) + 1)));
+    for (int t = 0; t < kTracks; t++) peak_[t].store(peak_[t].load() * 0.8f);
+    if (cn_ >= total) {
+      countBeat_.store(0);
+      state_.store(pending_.load(), std::memory_order_release);
+      st = state_.load();
+      if (m < n && st != kStopped) {
+        processMusic(in + m, out + m, int(n - m), st);
+      } else if (m < n) {
+        std::memset(out + m, 0, size_t(n - m) * sizeof(float));
+      }
+    }
+    return;
+  }
+  processMusic(in, out, n, st);
+}
+
+void Studio::processMusic(const float* in, float* out, int n, int st) {
+  float ip = 0.f;
+  for (int i = 0; i < n; i++) ip = std::max(ip, std::fabs(in[i]));
   if (st == kStopped) {
     std::memset(out, 0, size_t(n) * sizeof(float));
     for (int t = 0; t < kTracks; t++) peak_[t].store(peak_[t].load() * 0.8f);
@@ -59,6 +104,8 @@ void Studio::process(const float* in, float* out, int n) {
   const bool rec = (st == kRecording);
   const int skip = rec ? armed_.load() : -1;
   const int64_t p = pos_.load();
+  const bool click = clickPlay_.load();
+  const double beat = beatFrames();
 
   int64_t len[kTracks];
   float gain[kTracks];
@@ -81,6 +128,10 @@ void Studio::process(const float* in, float* out, int n) {
       tp[t] = std::max(tp[t], std::fabs(v));
       if (audible[t]) s += v;
     }
+    if (click) {
+      const double bi = std::floor(double(q) / beat);
+      s += 0.6f * clickAt(double(q) - bi * beat, false);
+    }
     out[i] = softClip(s);
   }
   for (int t = 0; t < kTracks; t++) {
@@ -100,15 +151,21 @@ void Studio::process(const float* in, float* out, int n) {
   }
   const int64_t np = p + n;
   pos_.store(np);
-  if (!rec && np >= maxLen() + kSr / 2) state_.store(kStopped);
+  if (!rec && np >= maxLen() + kSr / 2 && !click) state_.store(kStopped);
 }
 
 // ---- transport ----------------------------------------------------------------------
 
 void Studio::play() {
   std::lock_guard<std::mutex> g(ctl_);
-  if (state_.load() == kStopped) {
-    if (pos_.load() >= maxLen()) pos_.store(0);
+  if (state_.load() != kStopped) return;
+  if (pos_.load() >= maxLen() && !clickPlay_.load()) pos_.store(0);
+  if (countIn_.load() > 0 && countOnPlay_.load()) {
+    cn_ = 0;
+    countBeat_.store(1);
+    pending_.store(kPlaying);
+    state_.store(kCountIn, std::memory_order_release);
+  } else {
     state_.store(kPlaying, std::memory_order_release);
   }
 }
@@ -116,21 +173,31 @@ void Studio::play() {
 bool Studio::stop() {
   std::lock_guard<std::mutex> g(ctl_);
   state_.exchange(kStopped);
+  countBeat_.store(0);
   // Let an in-flight audio callback finish touching the take buffers.
   std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  if (recN_.load() == 0) recTrack_ = -1;  // cancelled during count-in: no take
   return recTrack_ >= 0 && recN_.load() > 0;  // a take is waiting for finalizeTake()
 }
 
 bool Studio::record(int track) {
   std::lock_guard<std::mutex> g(ctl_);
   if (track < 0 || track >= kTracks) return false;
+  const int prev = state_.load();
   state_.store(kStopped);
   std::this_thread::sleep_for(std::chrono::milliseconds(40));
   recStart_ = pos_.load();
   recTrack_ = track;
   recN_.store(0);
   armed_.store(track);
-  state_.store(kRecording, std::memory_order_release);
+  if (prev == kStopped && countIn_.load() > 0) {
+    cn_ = 0;
+    countBeat_.store(1);
+    pending_.store(kRecording);
+    state_.store(kCountIn, std::memory_order_release);
+  } else {
+    state_.store(kRecording, std::memory_order_release);
+  }
   return true;
 }
 
@@ -150,20 +217,38 @@ void Studio::setTrack(int t, float gain, bool mute, bool solo) {
 // ---- take processing -------------------------------------------------------------------
 
 std::string Studio::place(int t, const int16_t* raw, const int16_t* ref, int64_t n, int64_t start,
-                          int64_t lat, bool wipePrevious) {
+                          int64_t /*unusedLat*/, bool wipePrevious) {
   Take& tk = take_[t];
   if (wipePrevious && tk.has && tk.pEnd > tk.pStart)
     std::memset(data_[t] + tk.pStart, 0, size_t(tk.pEnd - tk.pStart) * sizeof(int16_t));
 
-  const bool clean = cleanMode_ != kCleanOff && echo_.valid();
-  const int adapt = (clean && cleanMode_ == kCleanAdaptive) ? 128 : 0;
-  const int64_t chunk = int64_t(60) * kSr;
-  const int64_t pad = clean ? int64_t(echo_.delay) + int64_t(echo_.h.size()) + (adapt ? 2 * kSr : 0) : 0;
+  // ---- choose delay + echo path -------------------------------------------------------
+  const int mode = cleanMode_;
+  const bool learn = (mode == kCleanLearn || mode == kCleanLearnAdaptive);
+  EchoPath path = echo_;
+  int64_t lat = int64_t(latency_) + trim_;
+  bool fitTried = false, fitUsed = false;
+  PathFit fit;
+  const int prior = latency_ > 0 ? latency_ : (echo_.valid() ? echo_.delay + 32 : 0);
+  if (learn && prior > 0 && n >= 65536) {
+    fitTried = true;
+    fit = fitPathI16(ref, raw, size_t(n), prior, 3500, 1024, 32);
+    if (fit.ok && std::abs(fit.delay - prior) <= 3500) {
+      fitUsed = true;
+      path = fit.path;
+      lat = int64_t(fit.delay) + trim_;
+    }
+  }
+  const bool clean = mode != kCleanOff && path.valid();
+  const bool segmented = clean && fitUsed && mode == kCleanLearnAdaptive && n >= int64_t(30) * kSr;
+  const int adapt = (clean && mode == kCleanAdaptive) ? 128 : 0;
   double eIn = 0, eOut = 0;
   int16_t peak = 0;
+  int segFits = 0;
 
-  for (int64_t a = 0; a < n; a += chunk) {
-    const int64_t b = std::min(n, a + chunk);
+  // Cancel [a,b) with `p` (context taken from before a so the filter has history) and write it.
+  auto emit = [&](int64_t a, int64_t b, const EchoPath& p, int adaptTaps) {
+    const int64_t pad = clean ? int64_t(p.delay) + int64_t(p.h.size()) + (adaptTaps ? 2 * kSr : 0) : 0;
     const int64_t w0 = std::max<int64_t>(0, a - pad);
     const size_t len = size_t(b - w0);
     std::vector<float> mic(len), rf(len), out(len);
@@ -172,7 +257,7 @@ std::string Studio::place(int t, const int16_t* raw, const int16_t* ref, int64_t
       rf[i] = float(ref[w0 + int64_t(i)]) * (1.f / 32768.f);
     }
     if (clean)
-      cancelEcho(mic.data(), rf.data(), len, echo_, out.data(), adapt, 0.1f);
+      cancelEcho(mic.data(), rf.data(), len, p, out.data(), adaptTaps, 0.05f);
     else
       out = mic;
     for (int64_t j = a; j < b; j++) {
@@ -185,6 +270,23 @@ std::string Studio::place(int t, const int16_t* raw, const int16_t* ref, int64_t
       data_[t][idx] = v;
       peak = std::max<int16_t>(peak, int16_t(std::abs(int(v))));
     }
+  };
+
+  if (segmented) {
+    // Re-learn the path every 15 s from a 30 s window: follows slow changes (hand moving,
+    // volume drift) without a per-sample adaptive filter that a loud voice can disturb.
+    const int64_t S = int64_t(15) * kSr;
+    for (int64_t a = 0; a < n; a += S) {
+      const int64_t b = std::min(n, a + S);
+      const int64_t w0 = std::max<int64_t>(0, a - S / 2), w1 = std::min(n, b + S / 2);
+      PathFit sf = fitPathI16(ref + w0, raw + w0, size_t(w1 - w0), fit.delay, 400, 1024, 32);
+      const bool good = sf.ok && std::abs(sf.delay - fit.delay) <= 400;
+      if (good) segFits++;
+      emit(a, b, good ? sf.path : path, 0);
+    }
+  } else {
+    const int64_t chunk = int64_t(60) * kSr;
+    for (int64_t a = 0; a < n; a += chunk) emit(a, std::min(n, a + chunk), path, adapt);
   }
   tk.has = true;
   tk.start = start;
@@ -196,12 +298,17 @@ std::string Studio::place(int t, const int16_t* raw, const int16_t* ref, int64_t
 
   double inDb = 10 * std::log10(eIn / double(std::max<int64_t>(n, 1)) + 1e-20);
   double outDb = 10 * std::log10(eOut / double(std::max<int64_t>(n, 1)) + 1e-20);
-  char buf[512];
+  char buf[900];
   snprintf(buf, sizeof buf,
-           "{\"ok\":true,\"track\":%d,\"seconds\":%.2f,\"latency_frames\":%lld,\"cleaned\":%s,"
-           "\"adaptive\":%s,\"mic_db\":%.1f,\"result_db\":%.1f,\"reduction_db\":%.1f,\"peak\":%.3f}",
-           t, double(n) / kSr, (long long)lat, clean ? "true" : "false", adapt ? "true" : "false", inDb,
-           outDb, inDb - outDb, double(peak) / 32768.0);
+           "{\"ok\":true,\"track\":%d,\"seconds\":%.2f,\"mode\":%d,\"latency_frames\":%lld,"
+           "\"delay_calibrated\":%d,\"fit_tried\":%s,\"fit_used\":%s,\"fit_delay\":%d,"
+           "\"fit_peak_ratio\":%.1f,\"fit_ceiling_db\":%.1f,\"trim_frames\":%d,"
+           "\"cleaned\":%s,\"adaptive\":%s,\"segment_fits\":%d,\"mic_db\":%.1f,\"result_db\":%.1f,"
+           "\"reduction_db\":%.1f,\"peak\":%.3f}",
+           t, double(n) / kSr, mode, (long long)lat, prior, fitTried ? "true" : "false",
+           fitUsed ? "true" : "false", fit.delay, fit.peakRatio, fit.ceilingDb, trim_,
+           clean ? "true" : "false", (adapt || segmented) ? "true" : "false", segFits, inDb, outDb, inDb - outDb,
+           double(peak) / 32768.0);
   return buf;
 }
 
@@ -211,7 +318,7 @@ std::string Studio::finalizeTake() {
   const int t = recTrack_;
   if (t < 0 || n <= 0) return "{\"ok\":false,\"error\":\"no take\"}";
   saveTakeFiles(t, raw_, ref_, n);
-  std::string r = place(t, raw_, ref_, n, recStart_, latency_, false);
+  std::string r = place(t, raw_, ref_, n, recStart_, 0, false);
   recTrack_ = -1;
   recN_.store(0);
   pos_.store(recStart_);
@@ -234,7 +341,7 @@ std::string Studio::reclean(int t) {
   if (f1) fclose(f1);
   if (f2) fclose(f2);
   if (!ok) return "{\"ok\":false,\"error\":\"take files missing\"}";
-  std::string r = place(t, raw.data(), ref.data(), tk.n, tk.start, latency_, true);
+  std::string r = place(t, raw.data(), ref.data(), tk.n, tk.start, 0, true);
   save();
   return r;
 }
@@ -351,8 +458,21 @@ float Studio::mixAt(int64_t q, int skip, bool anySolo) const {
   return softClip(s);
 }
 
+int Studio::peaks(int t, int bucket, float* out, int cap) const {
+  if (t < 0 || t >= kTracks || bucket <= 0) return 0;
+  const int64_t len = len_[t].load();
+  const int nb = int(std::min<int64_t>(cap, (len + bucket - 1) / bucket));
+  for (int b = 0; b < nb; b++) {
+    int16_t m = 0;
+    const int64_t a = int64_t(b) * bucket, e = std::min<int64_t>(len, a + bucket);
+    for (int64_t i = a; i < e; i++) m = std::max<int16_t>(m, int16_t(std::abs(int(data_[t][i]))));
+    out[b] = float(m) / 32768.f;
+  }
+  return nb;
+}
+
 void Studio::status(float* out, int cap) const {
-  float v[10];
+  float v[11];
   v[0] = float(pos_.load()) / kSr;
   v[1] = float(maxLen()) / kSr;
   v[2] = float(state_.load());
@@ -360,7 +480,8 @@ void Studio::status(float* out, int cap) const {
   v[7] = inPeak_.load();
   v[8] = float(recN_.load()) / kSr;
   v[9] = float(armed_.load());
-  for (int i = 0; i < cap && i < 10; i++) out[i] = v[i];
+  v[10] = float(countBeat_.load());
+  for (int i = 0; i < cap && i < 11; i++) out[i] = v[i];
 }
 
 }  // namespace fz

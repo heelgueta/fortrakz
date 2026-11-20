@@ -154,7 +154,10 @@ void cancelEcho(const float* mic, const float* ref, size_t n, const EchoPath& p,
   std::memcpy(xp.data() + T, x.data(), n * sizeof(float));
   std::vector<float> wr(T, 0.f);  // reversed weights: y = sum_m wr[m] * xp[j+1+m]
   const double a = 1.0 / 480.0;   // ~10 ms smoothing @48k
-  double eRes = 0, eEst = 0, pw = 0;
+  const double aFast = 1.0 / 48.0;  // ~1 ms: reacts to a voice onset before the slow one can
+  double eRes = 0, eFast = 0, eEst = 0, pw = 0;
+  int64_t hold = 0;  // frames to stay frozen after voice was detected
+  const int64_t holdLen = 14400;  // 300 ms
   for (size_t j = 0; j < n; j++) {
     pw += double(x[j]) * x[j];
     if (j >= T) pw -= double(x[j - T]) * x[j - T];
@@ -162,14 +165,160 @@ void cancelEcho(const float* mic, const float* ref, size_t n, const EchoPath& p,
     float y = 0.f;
     for (size_t m = 0; m < T; m++) y += wr[m] * win[m];
     float e = out[j] - y;
-    eRes = (1 - a) * eRes + a * double(out[j]) * out[j];
+    const double r2 = double(out[j]) * out[j];
+    eRes = (1 - a) * eRes + a * r2;
+    eFast = (1 - aFast) * eFast + aFast * r2;
     eEst = (1 - a) * eEst + a * double(est[j]) * est[j];
     out[j] = e;
-    if (eEst > 1e-8 && eRes < eEst) {
+    if (eFast > 0.5 * eEst || eRes > 0.5 * eEst) hold = holdLen;
+    if (hold > 0) {
+      hold--;
+      continue;
+    }
+    if (eEst > 1e-8) {
       float g = mu * e / float(pw + 1e-6);
       for (size_t m = 0; m < T; m++) wr[m] += g * win[m];
     }
   }
+}
+
+template <class TR, class TM>
+static PathFit fitPathT(const TR* ref, const TM* mic, size_t n, float sR, float sM, int prior, int half,
+                        int taps, int pre) {
+  PathFit r;
+  half = std::min(half, 4000);
+  taps = std::min(taps, 2048);
+  if (n < 65536 || prior < 0) return r;
+  auto R = [&](int64_t i) -> float { return (i < 0 || i >= int64_t(n)) ? 0.f : float(ref[i]) * sR; };
+  auto M = [&](int64_t i) -> float { return (i < 0 || i >= int64_t(n)) ? 0.f : float(mic[i]) * sM; };
+
+  // ---- stage 1: delay by averaged PHAT cross-correlation -------------------------------
+  {
+    const size_t B = 16384, hop = B / 2;
+    FftPlan plan(B);
+    const int64_t s = std::max(0, prior - 4096);
+    const int e = prior - int(s);  // expected lag in the shifted domain
+    std::vector<cd> acc(B, cd(0, 0)), X(B), Y(B);
+    const size_t total = (n > size_t(s) + B) ? (n - size_t(s) - B) / hop : 0;
+    const size_t stride = std::max<size_t>(1, total / 400);
+    size_t used = 0;
+    for (size_t b = 0; b < total; b += stride) {
+      const int64_t j0 = s + int64_t(b * hop);
+      double er = 0;
+      for (size_t i = 0; i < B; i++) {
+        double w = 0.5 - 0.5 * std::cos(2 * M_PI * double(i) / double(B));
+        float x = R(j0 + int64_t(i) - s), y = M(j0 + int64_t(i));
+        X[i] = w * x;
+        Y[i] = w * y;
+        er += double(x) * x;
+      }
+      if (er / double(B) < 1e-8) continue;  // silent reference: nothing to learn
+      plan.run(X.data(), false);
+      plan.run(Y.data(), false);
+      for (size_t k = 0; k < B; k++) {
+        cd c = Y[k] * std::conj(X[k]);
+        acc[k] += c / (std::abs(c) + 1e-12);
+      }
+      used++;
+    }
+    if (used < 4) return r;
+    plan.run(acc.data(), true);
+    double sum = 0, best = 0;
+    int bestLag = 0;
+    for (size_t k = 0; k < B; k++) sum += std::abs(acc[k]);
+    for (int lag = e - half; lag <= e + half; lag++) {
+      int idx = ((lag % int(B)) + int(B)) % int(B);
+      double v = std::abs(acc[size_t(idx)]);
+      if (v > best) {
+        best = v;
+        bestLag = lag;
+      }
+    }
+    r.delay = int(s) + bestLag;
+    r.peakRatio = best / (sum / double(B) + 1e-30);
+  }
+
+  // ---- stage 2: transfer function H1 = Sxy / Sxx, iteratively reweighted ---------------
+  // Blocks where the mic is NOT explained by the playback (a loud voice) get small weights,
+  // so the filter is learned mostly from the gaps between phrases.
+  {
+    const size_t B = 8192, hop = B / 2;
+    FftPlan plan(B);
+    const int d0 = std::max(0, r.delay - pre);
+    const size_t total = n > B + size_t(d0) ? (n - B - size_t(d0)) / hop : 0;
+    const size_t stride = std::max<size_t>(1, total / 600);
+    std::vector<cd> X(B), Y(B), H(B, cd(0, 0));
+    std::vector<double> sxx(B), syy(B);
+    std::vector<cd> sxy(B);
+    double tot = 0, res = 0;
+    for (int pass = 0; pass < 4; pass++) {
+      std::fill(sxx.begin(), sxx.end(), 0.0);
+      std::fill(syy.begin(), syy.end(), 0.0);
+      std::fill(sxy.begin(), sxy.end(), cd(0, 0));
+      size_t used = 0;
+      for (size_t b = 0; b < total; b += stride) {
+        const int64_t j0 = int64_t(d0) + int64_t(b * hop);
+        double er = 0;
+        for (size_t i = 0; i < B; i++) {
+          double w = 0.5 - 0.5 * std::cos(2 * M_PI * double(i) / double(B));
+          float x = R(j0 + int64_t(i) - d0), y = M(j0 + int64_t(i));
+          X[i] = w * x;
+          Y[i] = w * y;
+          er += double(x) * x;
+        }
+        if (er / double(B) < 1e-8) continue;
+        plan.run(X.data(), false);
+        plan.run(Y.data(), false);
+        double wgt = 1.0;
+        if (pass > 0) {
+          double e = 0, y2 = 0;
+          for (size_t k = 0; k < B / 2; k++) {
+            e += std::norm(Y[k] - H[k] * X[k]);
+            y2 += std::norm(Y[k]);
+          }
+          wgt = 1.0 / (e + 1e-4 * y2 + 1e-9);
+        }
+        for (size_t k = 0; k < B; k++) {
+          sxx[k] += wgt * std::norm(X[k]);
+          syy[k] += wgt * std::norm(Y[k]);
+          sxy[k] += wgt * (Y[k] * std::conj(X[k]));
+        }
+        used++;
+      }
+      if (used < 4) return r;
+      double mean = 0;
+      for (size_t k = 0; k < B; k++) mean += sxx[k];
+      mean /= double(B);
+      const double lambda = 1e-3 * mean + 1e-30;
+      tot = 0;
+      res = 0;
+      for (size_t k = 0; k < B; k++) {
+        H[k] = sxy[k] / (sxx[k] + lambda);
+        tot += syy[k];
+        res += std::max(0.0, syy[k] - std::norm(sxy[k]) / (sxx[k] + 1e-30));
+      }
+    }
+    std::vector<cd> h = H;
+    plan.run(h.data(), true);
+    r.path.delay = d0;
+    r.path.h.assign(size_t(taps), 0.f);
+    const int taper = taps / 4;
+    for (int k = 0; k < taps; k++) {
+      double w = 1.0;
+      if (k >= taps - taper) w = 0.5 + 0.5 * std::cos(M_PI * double(k - (taps - taper)) / double(taper));
+      r.path.h[size_t(k)] = float(h[size_t(k)].real() * w);
+    }
+    r.ceilingDb = 10 * std::log10(tot / (res + 1e-30));
+  }
+  r.ok = r.peakRatio > 6.0;  // delay found with confidence; the filter itself is harmless if echo is weak
+  return r;
+}
+
+PathFit fitPathI16(const int16_t* ref, const int16_t* mic, size_t n, int prior, int half, int taps, int pre) {
+  return fitPathT(ref, mic, n, 1.f / 32768.f, 1.f / 32768.f, prior, half, taps, pre);
+}
+PathFit fitPathF(const float* ref, const float* mic, size_t n, int prior, int half, int taps, int pre) {
+  return fitPathT(ref, mic, n, 1.f, 1.f, prior, half, taps, pre);
 }
 
 double powerDb(const float* x, size_t n) {

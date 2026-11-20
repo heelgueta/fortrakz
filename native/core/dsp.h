@@ -44,6 +44,20 @@ EchoPath estimateEchoPath(const float* ref, const float* mic, size_t n, size_t m
 void cancelEcho(const float* mic, const float* ref, size_t n, const EchoPath& p, float* out,
                 int adaptTaps, float mu);
 
+// ---- per-take path learning -------------------------------------------------------
+// Learn the speaker->mic path and its exact delay from the take itself, using the
+// music that was playing as the excitation (voice is uncorrelated with it, so it
+// only adds estimation noise). `prior` is the calibrated delay in samples.
+struct PathFit {
+  EchoPath path;
+  int delay = 0;           // total delay (peak position) in samples
+  double peakRatio = 0;    // PHAT peak / mean: confidence of the delay
+  double ceilingDb = 0;    // best reduction ANY linear filter could reach on this take
+  bool ok = false;
+};
+PathFit fitPathI16(const int16_t* ref, const int16_t* mic, size_t n, int prior, int half, int taps, int pre);
+PathFit fitPathF(const float* ref, const float* mic, size_t n, int prior, int half, int taps, int pre);
+
 double powerDb(const float* x, size_t n);
 // 10*log10(P(mic)/P(res)) over n samples
 double erleDb(const float* mic, const float* res, size_t n);
